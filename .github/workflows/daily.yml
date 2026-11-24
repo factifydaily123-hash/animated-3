@@ -1,0 +1,150 @@
+name: Daily Parable Explainer Short
+
+on:
+  schedule:
+    # Har 2 din mein ek baar. Ghanta/minute random hoga script ke andar.
+    - cron: "0 0 */2 * *"
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: "YouTube par upload karna hai? Band karo to sirf test hoga (video artifact mein milegi)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:                 # do runs ek saath na chalein (history.json push conflict se bachne ke liye)
+  group: shorts-bot
+  cancel-in-progress: false
+
+env:
+  MAX_DELAY_MIN: "15"
+  DO_UPLOAD: ${{ (github.event_name == 'workflow_dispatch' && inputs.upload == false) && 'false' || 'true' }}
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - name: Random wait (sirf scheduled run par)
+        if: github.event_name == 'schedule'
+        run: |
+          # Random hour/minute/second — poora din random
+          RAND_H=$((RANDOM % 24))
+          RAND_M=$((RANDOM % 60))
+          RAND_S=$((RANDOM % 60))
+          NOW_H=$(date +%H)
+          NOW_M=$(date +%M)
+          NOW_S=$(date +%S)
+
+          TARGET_SEC=$(( RAND_H*3600 + RAND_M*60 + RAND_S ))
+          NOW_SEC=$(( 10#$NOW_H*3600 + 10#$NOW_M*60 + 10#$NOW_S ))
+          DELAY=$(( TARGET_SEC - NOW_SEC ))
+          if [ "$DELAY" -le 0 ]; then
+            DELAY=$(( DELAY + 86400 ))
+          fi
+
+          # Safety cap: runner minutes bachane ke liye max 6 ghante
+          MAX_SLEEP=$(( 6*3600 ))
+          if [ "$DELAY" -gt "$MAX_SLEEP" ]; then
+            DELAY=$(( MAX_SLEEP ))
+          fi
+
+          echo "Random target: ${RAND_H}:${RAND_M}:${RAND_S} UTC | abhi: ${NOW_H}:${NOW_M}:${NOW_S} UTC"
+          echo "Sleeping $((DELAY / 3600))h $(( (DELAY % 3600) / 60 ))m $((DELAY % 60))s"
+          sleep "$DELAY"
+
+      - uses: actions/checkout@v4
+
+      - name: Check required secrets
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          YT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YT_REFRESH: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+        run: |
+          [ -n "$GEMINI_API_KEY" ] || { echo "::error::GEMINI_API_KEY secret missing"; exit 1; }
+          if [ "$DO_UPLOAD" = "true" ]; then
+            [ -n "$YT_ID" ] && [ -n "$YT_SECRET" ] && [ -n "$YT_REFRESH" ] || { echo "::error::YouTube secret(s) missing"; exit 1; }
+          fi
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install system packages
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg espeak-ng fonts-dejavu-core
+
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+
+      - name: Cache Kokoro voice model (sirf awaaz)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-kokoro-82m-v1
+
+      - name: Generate parable explainer scene JSON (Gemini)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python story_gen.py
+
+      - name: Show generated story (check karo office to nahi)
+        run: |
+          python - <<'PY'
+          import json
+          d = json.load(open("script.json", encoding="utf-8"))
+          print("TOPIC:", d.get("topic"))
+          print("TITLE:", d.get("title"))
+          print("FACT :", d.get("fact"))
+          for i, s in enumerate(d["scenes"], 1):
+              print(i, s.get("place"), "|", s.get("camera_move"), "|", " / ".join(f'{c["name"]}: {c["line"]}' for c in s["characters"]))
+          PY
+
+      - name: Render video (45 min se kam)
+        timeout-minutes: 45
+        env:
+          MUSIC_MODE: synth
+          KOKORO_VOICE: am_michael
+          EDGE_VOICE: en-US-GuyNeural    # Kokoro fail ho to backup awaaz
+          VOICE_SPEED: "1.0"
+          HF_HUB_DISABLE_TELEMETRY: "1"
+        run: |
+          fc-cache -f
+          python render_story.py
+
+      - name: Upload to YouTube
+        if: env.DO_UPLOAD == 'true'
+        env:
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+        run: python main.py
+
+      - name: Keep video as artifact (manual runs only)
+        if: always() && github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: video
+          path: |
+            output.mp4
+            script.json
+            story_plan.md
+          retention-days: 2
+          if-no-files-found: ignore
+
+      - name: Save topic history
+        if: env.DO_UPLOAD == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add history.json
+          git diff --cached --quiet || git commit -m "update topic history"
+          # --autostash: render ki banayi baaki badli hui files pull ke dauran side par rakh deta hai
+          git pull --rebase --autostash
+          git push
